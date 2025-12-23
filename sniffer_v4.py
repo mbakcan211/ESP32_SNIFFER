@@ -312,7 +312,7 @@ class DashboardWindow(QMainWindow):
         self.cmd_input.returnPressed.connect(self.process_command)
         
         # Autocomplete
-        self.commands = ["help", "clear", "log start", "log stop", "connect", "disconnect", "quit", "status", "filter", "filter clear", "target", "export"]
+        self.commands = ["help", "clear", "log start", "log stop", "connect", "disconnect", "quit", "status", "filter", "filter clear", "target", "export", "purge"]
         self.completer = QCompleter(self.commands)
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.cmd_input.setCompleter(self.completer)
@@ -429,7 +429,7 @@ class DashboardWindow(QMainWindow):
         args = parts[1:]
 
         if cmd == "help":
-            self.log_to_terminal("COMMANDS: help, clear, log [start/stop], connect, disconnect, quit, status, filter [text/clear], target <mac>, export")
+            self.log_to_terminal("COMMANDS: help, clear, log [start/stop], connect, disconnect, quit, status, filter [text/clear], target <mac>, export, purge")
         elif cmd == "clear":
             self.terminal_display.clear()
         elif cmd == "quit":
@@ -488,6 +488,10 @@ class DashboardWindow(QMainWindow):
                 self.log_to_terminal(f"Session exported to {filename}")
             except Exception as e:
                 self.log_to_terminal(f"[ERROR] Export failed: {e}")
+        elif cmd == "purge":
+            self.device_history.clear()
+            self.device_table.setRowCount(0)
+            self.log_to_terminal("CACHE CLEARED. MEMORY FREED.")
         else:
             self.log_to_terminal(f"Unknown command: {cmd}")
 
