@@ -6,13 +6,14 @@ import time
 import numpy as np
 from collections import defaultdict
 from datetime import datetime
+import csv
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTextEdit, QPushButton, QComboBox, 
                              QLabel, QTableWidget, QTableWidgetItem, QHeaderView, 
-                             QSplitter, QFrame)
+                             QSplitter, QFrame, QLineEdit, QCompleter)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QIcon
+from PyQt6.QtGui import QColor, QFont, QIcon, QTextCursor, QShortcut, QKeySequence
 
 # --- Matplotlib Integration ---
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -212,6 +213,21 @@ class GraphWindow(QMainWindow):
         self.figure.autofmt_xdate()
         self.canvas.draw()
 
+# --- Custom Input for Tab Autocomplete ---
+class CommandInput(QLineEdit):
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Tab:
+            completer = self.completer()
+            if completer and completer.popup().isVisible():
+                if not completer.popup().currentIndex().isValid():
+                    completer.popup().setCurrentIndex(completer.completionModel().index(0, 0))
+                
+                index = completer.popup().currentIndex()
+                if index.isValid():
+                    completer.popup().activated.emit(index)
+                return
+        super().keyPressEvent(event)
+
 # --- Main Dashboard Window ---
 class DashboardWindow(QMainWindow):
     def __init__(self):
@@ -243,6 +259,20 @@ class DashboardWindow(QMainWindow):
         top_bar.addWidget(self.port_selector)
         top_bar.addWidget(self.btn_connect)
         top_bar.addStretch()
+        
+        # Recording Indicator
+        self.lbl_rec = QLabel("● REC")
+        self.lbl_rec.setStyleSheet(f"color: {NEON_RED}; font-weight: bold; font-size: 14px; margin-right: 10px;")
+        self.lbl_rec.setVisible(False)
+        top_bar.addWidget(self.lbl_rec)
+        
+        # Logging Button
+        self.btn_log = QPushButton("START LOGGING")
+        self.btn_log.setCheckable(True)
+        self.btn_log.clicked.connect(self.toggle_logging)
+        self.btn_log.setStyleSheet(f"background-color: #333; color: {TEXT_COLOR}; padding: 6px; border: 1px solid #555;")
+        top_bar.addWidget(self.btn_log)
+        
         main_layout.addLayout(top_bar)
 
         # 2. Main Content (Splitter)
@@ -265,11 +295,31 @@ class DashboardWindow(QMainWindow):
         """)
         splitter.addWidget(self.device_table)
 
-        # Raw Terminal Log
+        # Terminal Section (Display + Input)
+        term_widget = QWidget()
+        term_layout = QVBoxLayout(term_widget)
+        term_layout.setContentsMargins(0, 0, 0, 0)
+        term_layout.setSpacing(0)
+
         self.terminal_display = QTextEdit()
         self.terminal_display.setReadOnly(True)
-        self.terminal_display.setStyleSheet("background-color: #000; color: #888; font-family: Monospace; font-size: 12px; border-top: 2px solid #333;")
-        splitter.addWidget(self.terminal_display)
+        self.terminal_display.setStyleSheet("background-color: #080808; color: #AAA; font-family: Consolas, Monospace; font-size: 14px; border: none; border-top: 1px solid #333; padding: 5px;")
+        term_layout.addWidget(self.terminal_display)
+
+        self.cmd_input = CommandInput()
+        self.cmd_input.setPlaceholderText("ENTER COMMAND (Type 'help')...")
+        self.cmd_input.setStyleSheet(f"background-color: #111; color: {NEON_GREEN}; font-family: Monospace; font-size: 14px; border: none; border-top: 1px solid #333; padding: 4px;")
+        self.cmd_input.returnPressed.connect(self.process_command)
+        
+        # Autocomplete
+        self.commands = ["help", "clear", "log start", "log stop", "connect", "disconnect", "quit", "status", "filter", "filter clear", "target", "export"]
+        self.completer = QCompleter(self.commands)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.cmd_input.setCompleter(self.completer)
+        
+        term_layout.addWidget(self.cmd_input)
+
+        splitter.addWidget(term_widget)
 
         main_layout.addWidget(splitter)
         
@@ -279,6 +329,22 @@ class DashboardWindow(QMainWindow):
         main_layout.addWidget(self.lbl_status)
 
         self.worker = None
+        self.log_file = None
+        self.csv_writer = None
+        self.filter_query = "" # Store active filter
+        
+        # Recording Blink Timer
+        self.rec_timer = QTimer()
+        self.rec_timer.timeout.connect(self.blink_rec)
+        self.rec_blink_state = True
+
+        # Shortcuts
+        self.shortcut_quit = QShortcut(QKeySequence("Esc"), self)
+        self.shortcut_quit.activated.connect(self.handle_esc)
+        self.shortcut_fs = QShortcut(QKeySequence("F11"), self)
+        self.shortcut_fs.activated.connect(self.toggle_fullscreen)
+        self.shortcut_log = QShortcut(QKeySequence("Ctrl+L"), self)
+        self.shortcut_log.activated.connect(self.btn_log.click)
 
     def refresh_ports(self):
         self.port_selector.clear()
@@ -299,6 +365,7 @@ class DashboardWindow(QMainWindow):
             self.btn_connect.setStyleSheet(f"background-color: {NEON_RED}; color: white; padding: 6px; font-weight: bold;")
             self.lbl_status.setText(f"LINK ESTABLISHED ON {port}")
             self.lbl_status.setStyleSheet(f"color: {NEON_GREEN};")
+            self.log_to_terminal(f"LINK ESTABLISHED: {port}")
         else:
             self.worker.stop()
             self.worker = None
@@ -306,23 +373,161 @@ class DashboardWindow(QMainWindow):
             self.btn_connect.setStyleSheet("background-color: #005500; color: white; padding: 6px; font-weight: bold;")
             self.lbl_status.setText("LINK TERMINATED")
             self.lbl_status.setStyleSheet("color: #666;")
+            self.log_to_terminal("LINK TERMINATED")
+
+    def handle_esc(self):
+        if self.cmd_input.text():
+            self.cmd_input.clear()
+        else:
+            QApplication.quit()
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def blink_rec(self):
+        self.rec_blink_state = not self.rec_blink_state
+        color = NEON_RED if self.rec_blink_state else "#440000"
+        self.lbl_rec.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 14px; margin-right: 10px;")
+
+    def toggle_logging(self):
+        if self.btn_log.isChecked():
+            filename = f"scan_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            try:
+                self.log_file = open(filename, mode='w', newline='', encoding='utf-8')
+                self.csv_writer = csv.writer(self.log_file)
+                self.csv_writer.writerow(["Timestamp", "MAC", "Type", "RSSI"])
+                self.btn_log.setText("STOP LOGGING")
+                self.btn_log.setStyleSheet(f"background-color: {NEON_RED}; color: white; padding: 6px; font-weight: bold; border: none;")
+                self.log_to_terminal(f"Logging started: {filename}")
+                self.lbl_rec.setVisible(True)
+                self.rec_timer.start(500)
+            except Exception as e:
+                self.log_to_terminal(f"[ERROR] Could not start logging: {e}")
+                self.btn_log.setChecked(False)
+        else:
+            if self.log_file:
+                self.log_file.close()
+                self.log_file = None
+                self.csv_writer = None
+            self.btn_log.setText("START LOGGING")
+            self.btn_log.setStyleSheet(f"background-color: #333; color: {TEXT_COLOR}; padding: 6px; border: 1px solid #555;")
+            self.log_to_terminal("Logging stopped.")
+            self.rec_timer.stop()
+            self.lbl_rec.setVisible(False)
+
+    def process_command(self):
+        cmd_text = self.cmd_input.text().strip()
+        self.cmd_input.clear()
+        if not cmd_text: return
+
+        self.log_to_terminal(f"> {cmd_text}")
+        parts = cmd_text.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        if cmd == "help":
+            self.log_to_terminal("COMMANDS: help, clear, log [start/stop], connect, disconnect, quit, status, filter [text/clear], target <mac>, export")
+        elif cmd == "clear":
+            self.terminal_display.clear()
+        elif cmd == "quit":
+            QApplication.quit()
+        elif cmd == "connect":
+            if self.worker is None: self.toggle_connection()
+        elif cmd == "disconnect":
+            if self.worker: self.toggle_connection()
+        elif cmd == "log":
+            if not args:
+                self.log_to_terminal("Usage: log start | log stop")
+            elif args[0] == "start":
+                if not self.btn_log.isChecked():
+                    self.btn_log.setChecked(True)
+                    self.toggle_logging()
+            elif args[0] == "stop":
+                if self.btn_log.isChecked():
+                    self.btn_log.setChecked(False)
+                    self.toggle_logging()
+        elif cmd == "status":
+            status_msg = f"PORT: {self.port_selector.currentText()} | BAUD: {BAUD_RATE}\n"
+            status_msg += f"LOGGING: {'ACTIVE' if self.btn_log.isChecked() else 'OFF'}\n"
+            status_msg += f"TRACKED DEVICES: {len(self.device_history)}"
+            self.log_to_terminal(status_msg)
+        elif cmd == "filter":
+            if not args:
+                self.log_to_terminal("Usage: filter <text> | filter clear")
+            elif args[0] == "clear":
+                self.filter_query = ""
+                self.log_to_terminal("Filter cleared.")
+            else:
+                self.filter_query = args[0].lower()
+                self.log_to_terminal(f"Filter set to: '{self.filter_query}'")
+        elif cmd == "target":
+            if not args:
+                self.log_to_terminal("Usage: target <mac_address>")
+            else:
+                mac = args[0]
+                if mac in self.device_history:
+                    self.open_analysis_window(mac)
+                    self.log_to_terminal(f"Targeting {mac}...")
+                else:
+                    self.log_to_terminal(f"Device {mac} not found in history.")
+        elif cmd == "export":
+            filename = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            try:
+                serializable_history = {}
+                for k, v in self.device_history.items():
+                    serializable_history[k] = {
+                        "timestamps": [t.isoformat() for t in v["timestamps"]],
+                        "rssi": v["rssi"],
+                        "type": v["type"]
+                    }
+                with open(filename, 'w') as f:
+                    json.dump(serializable_history, f, indent=4)
+                self.log_to_terminal(f"Session exported to {filename}")
+            except Exception as e:
+                self.log_to_terminal(f"[ERROR] Export failed: {e}")
+        else:
+            self.log_to_terminal(f"Unknown command: {cmd}")
 
     def log_to_terminal(self, text):
-        if not text.startswith("{"):
-            self.terminal_display.append(text)
+        if text.startswith("{"): return
+
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        color = "#888888" # Default Gray
+        
+        if text.startswith(">"): 
+            color = NEON_GREEN
+            text = text.replace(">", "", 1).strip()
+            prefix = "CMD"
+        elif "[ERROR]" in text:
+            color = NEON_RED
+            prefix = "ERR"
+        elif "Logging" in text or "LINK" in text:
+            color = NEON_CYAN
+            prefix = "SYS"
+        else:
+            prefix = "RX "
+
+        html = f'<span style="color:#444;">[{timestamp}]</span> <span style="color:{color}; font-weight:bold;">{prefix}</span> <span style="color:#DDD;">{text}</span>'
+        self.terminal_display.append(html)
+        
+        # Auto-scroll
+        cursor = self.terminal_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.terminal_display.setTextCursor(cursor)
 
     def process_json_data(self, data):
         timestamp = datetime.now()
         devices_list = data.get("devices", [])
         
-        self.device_table.setRowCount(len(devices_list))
-        
-        for row, dev in enumerate(devices_list):
+        # 1. Update History & Log
+        for dev in devices_list:
             mac = dev.get("mac", "Unknown")
             rssi = dev.get("rssi", 0)
             dev_type = dev.get("type", "Unknown")
-            
-            # 1. Store History
+
             self.device_history[mac]["timestamps"].append(timestamp)
             self.device_history[mac]["rssi"].append(rssi)
             self.device_history[mac]["type"] = dev_type
@@ -331,20 +536,50 @@ class DashboardWindow(QMainWindow):
             if len(self.device_history[mac]["timestamps"]) > 500:  # <--- CHANGED from 100
                 self.device_history[mac]["timestamps"].pop(0)
                 self.device_history[mac]["rssi"].pop(0)
+            
+            # Log to CSV
+            if self.csv_writer:
+                self.csv_writer.writerow([timestamp.strftime('%Y-%m-%d %H:%M:%S.%f'), mac, dev_type, rssi])
 
-            # 2. Update Table
+        # 2. Update Table (Show ALL history)
+        all_macs = list(self.device_history.keys())
+        
+        # Sort by last seen timestamp (Descending) so active devices appear at the top
+        all_macs.sort(key=lambda m: self.device_history[m]["timestamps"][-1] if self.device_history[m]["timestamps"] else datetime.min, reverse=True)
+        
+        self.device_table.setRowCount(len(all_macs))
+        
+        for row, mac in enumerate(all_macs):
+            history = self.device_history[mac]
+            dev_type = history["type"]
+            rssi = history["rssi"][-1] if history["rssi"] else 0
+            
+            # Calculate Status
+            if history["timestamps"]:
+                last_seen = history["timestamps"][-1]
+                seconds_ago = (timestamp - last_seen).total_seconds()
+                status_text = "TRACKING" if seconds_ago < 2.0 else f"LOST {seconds_ago:.1f}s"
+            else:
+                status_text = "UNKNOWN"
+
             self.device_table.setItem(row, 0, QTableWidgetItem(mac))
             self.device_table.setItem(row, 1, QTableWidgetItem(dev_type))
             self.device_table.setItem(row, 2, QTableWidgetItem(str(rssi)))
-            
-            seen_ms = dev.get('seen_ms', 0)
-            status_text = "TRACKING" if seen_ms < 2000 else f"LOST {seen_ms/1000:.1f}s"
             self.device_table.setItem(row, 3, QTableWidgetItem(status_text))
+            
+            # Apply Filter
+            if self.filter_query:
+                match = (self.filter_query in mac.lower()) or (self.filter_query in dev_type.lower())
+                self.device_table.setRowHidden(row, not match)
+            else:
+                self.device_table.setRowHidden(row, False)
 
-    def open_graph_window(self, item):
-        row = item.row()
+    def open_graph_window(self, index):
+        row = index.row()
         mac = self.device_table.item(row, 0).text()
-        
+        self.open_analysis_window(mac)
+
+    def open_analysis_window(self, mac):
         # Focus existing window if open
         for win in self.active_graphs:
             if win.mac == mac and win.isVisible():

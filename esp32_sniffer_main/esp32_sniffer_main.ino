@@ -3,7 +3,7 @@
 #include <vector>
 
 // --- Configuration ---
-#define HOP_INTERVAL 250        
+#define HOP_INTERVAL 50        
 #define PRINT_INTERVAL 100     // Faster updates (1 second) for the GUI
 #define PURGE_INTERVAL 10000    
 
@@ -83,12 +83,15 @@ void setup() {
 
 void loop() {
   static unsigned long lastPrintTime = 0;
+  static unsigned long lastHopTime = 0;
   static int currentChannel = 1;
 
-  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-  currentChannel++;
-  if (currentChannel > 13) currentChannel = 1;
-  delay(HOP_INTERVAL);
+  if (millis() - lastHopTime > HOP_INTERVAL) {
+    lastHopTime = millis();
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    currentChannel++;
+    if (currentChannel > 13) currentChannel = 1;
+  }
 
   if (millis() - lastPrintTime > PRINT_INTERVAL) {
     lastPrintTime = millis();
