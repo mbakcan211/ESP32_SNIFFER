@@ -58,6 +58,13 @@ class SerialWorker(QThread):
             if hasattr(self, 'serial_port') and self.serial_port.is_open:
                 self.serial_port.close()
 
+    def send(self, text):
+        if hasattr(self, 'serial_port') and self.serial_port and self.serial_port.is_open:
+            try:
+                self.serial_port.write((text + '\n').encode('utf-8'))
+            except Exception as e:
+                self.data_received.emit(f"[ERROR] Send failed: {e}")
+
     def stop(self):
         self.running = False
         self.wait()
@@ -258,6 +265,12 @@ class DashboardWindow(QMainWindow):
         top_bar.addWidget(QLabel("INTERFACE PORT:"))
         top_bar.addWidget(self.port_selector)
         top_bar.addWidget(self.btn_connect)
+        
+        # Heartbeat LED
+        self.lbl_heartbeat = QLabel("● LINK ACTIVE")
+        self.lbl_heartbeat.setStyleSheet("color: #003300; font-weight: bold; font-size: 12px; margin-left: 10px;")
+        top_bar.addWidget(self.lbl_heartbeat)
+        
         top_bar.addStretch()
         
         # Recording Indicator
@@ -312,7 +325,7 @@ class DashboardWindow(QMainWindow):
         self.cmd_input.returnPressed.connect(self.process_command)
         
         # Autocomplete
-        self.commands = ["help", "clear", "log start", "log stop", "connect", "disconnect", "quit", "status", "filter", "filter clear", "target", "export", "purge"]
+        self.commands = ["help", "clear", "log start", "log stop", "connect", "disconnect", "quit", "status", "filter", "filter clear", "target", "export", "purge", "restart", "remote_clear", "send"]
         self.completer = QCompleter(self.commands)
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.cmd_input.setCompleter(self.completer)
@@ -345,6 +358,12 @@ class DashboardWindow(QMainWindow):
         self.shortcut_fs.activated.connect(self.toggle_fullscreen)
         self.shortcut_log = QShortcut(QKeySequence("Ctrl+L"), self)
         self.shortcut_log.activated.connect(self.btn_log.click)
+        
+        # Heartbeat Timer
+        self.hb_fade_timer = QTimer()
+        self.hb_fade_timer.setInterval(50) 
+        self.hb_fade_timer.timeout.connect(self.update_heartbeat_fade)
+        self.hb_intensity = 0.0
 
     def refresh_ports(self):
         self.port_selector.clear()
@@ -392,6 +411,24 @@ class DashboardWindow(QMainWindow):
         color = NEON_RED if self.rec_blink_state else "#440000"
         self.lbl_rec.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 14px; margin-right: 10px;")
 
+    def trigger_heartbeat(self):
+        self.hb_intensity = 1.0
+        self.update_heartbeat_style()
+        self.hb_fade_timer.start()
+
+    def update_heartbeat_fade(self):
+        self.hb_intensity -= 0.05 # Fade out speed
+        if self.hb_intensity <= 0:
+            self.hb_intensity = 0
+            self.hb_fade_timer.stop()
+        self.update_heartbeat_style()
+
+    def update_heartbeat_style(self):
+        # Interpolate between Dark Green (#003300) and Neon Green (#00FF00)
+        # Green channel: 51 to 255
+        g = int(51 + (255 - 51) * self.hb_intensity)
+        self.lbl_heartbeat.setStyleSheet(f"color: #00{g:02X}00; font-weight: bold; font-size: 12px; margin-left: 10px;")
+
     def toggle_logging(self):
         if self.btn_log.isChecked():
             filename = f"scan_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -429,7 +466,7 @@ class DashboardWindow(QMainWindow):
         args = parts[1:]
 
         if cmd == "help":
-            self.log_to_terminal("COMMANDS: help, clear, log [start/stop], connect, disconnect, quit, status, filter [text/clear], target <mac>, export, purge")
+            self.log_to_terminal("COMMANDS: help, clear, log, connect, disconnect, quit, status, filter, target, export, purge, restart, remote_clear, send <cmd>")
         elif cmd == "clear":
             self.terminal_display.clear()
         elif cmd == "quit":
@@ -492,6 +529,21 @@ class DashboardWindow(QMainWindow):
             self.device_history.clear()
             self.device_table.setRowCount(0)
             self.log_to_terminal("CACHE CLEARED. MEMORY FREED.")
+        elif cmd == "restart":
+            if self.worker:
+                self.worker.send("RESTART")
+                self.log_to_terminal(">> SENT: RESTART")
+        elif cmd == "remote_clear":
+            if self.worker:
+                self.worker.send("CLEAR")
+                self.log_to_terminal(">> SENT: CLEAR (Remote DB)")
+        elif cmd == "send":
+            if self.worker and args:
+                msg = " ".join(args)
+                self.worker.send(msg)
+                self.log_to_terminal(f">> SENT: {msg}")
+            else:
+                self.log_to_terminal("Usage: send <command_string>")
         else:
             self.log_to_terminal(f"Unknown command: {cmd}")
 
@@ -524,6 +576,12 @@ class DashboardWindow(QMainWindow):
 
     def process_json_data(self, data):
         timestamp = datetime.now()
+        
+        if "msg" in data:
+            self.log_to_terminal(f"REMOTE: {data['msg']}")
+            if data["msg"] == "HEARTBEAT":
+                self.trigger_heartbeat()
+
         devices_list = data.get("devices", [])
         
         # 1. Update History & Log

@@ -21,10 +21,10 @@ struct RawPacket {
 };
 
 struct Device {
-  String mac;
+  uint8_t mac[6];
   int rssi;
   unsigned long lastSeen;
-  String type;
+  uint8_t typeCode;
 };
 
 // --- Globals ---
@@ -49,6 +49,9 @@ void wifi_promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
   uint8_t* data = pkt->payload;
   
+  // Safety: Ensure packet is long enough to contain header (Frame Control + 3 MACs approx)
+  if (pkt->rx_ctrl.sig_len < 24) return; 
+
   // 1. Extract raw data
   int rssi = pkt->rx_ctrl.rssi;
   uint8_t frameControl = data[0];
@@ -85,22 +88,17 @@ void processingTask(void * parameter) {
     // Wait for packet (block indefinitely until data arrives)
     if (xQueueReceive(packetQueue, &pkt, portMAX_DELAY)) {
       
-      String macStr = macToString(pkt.mac);
-      String typeStr = "Unknown";
-      if (pkt.typeCode == 1) typeStr = "ROUTER";
-      if (pkt.typeCode == 2) typeStr = "STATION";
-
       // CRITICAL SECTION: Modifying the Vector
       if (xSemaphoreTake(dbMutex, portMAX_DELAY)) {
         
         bool known = false;
         for (auto &d : foundDevices) {
-          if (d.mac == macStr) {
+          if (memcmp(d.mac, pkt.mac, 6) == 0) {
             d.rssi = pkt.rssi;
             d.lastSeen = millis();
             // Update type if we learn more
-            if (d.type == "Unknown" || typeStr == "ROUTER") {
-              d.type = typeStr;
+            if (d.typeCode == 0 || pkt.typeCode == 1) {
+              d.typeCode = pkt.typeCode;
             }
             known = true;
             break;
@@ -109,10 +107,10 @@ void processingTask(void * parameter) {
 
         if (!known) {
           Device newDevice;
-          newDevice.mac = macStr;
+          memcpy(newDevice.mac, pkt.mac, 6);
           newDevice.rssi = pkt.rssi;
           newDevice.lastSeen = millis();
-          newDevice.type = typeStr;
+          newDevice.typeCode = pkt.typeCode;
           foundDevices.push_back(newDevice);
         }
         
@@ -125,8 +123,15 @@ void processingTask(void * parameter) {
 // --- Task: Serial Output & Purge ---
 // Handles JSON printing and cleaning old devices
 void outputTask(void * parameter) {
+  unsigned long lastHeartbeat = 0;
   while(1) {
     vTaskDelay(PRINT_INTERVAL / portTICK_PERIOD_MS); // Wait 100ms
+
+    // Send Heartbeat every 5 seconds
+    if (millis() - lastHeartbeat > 5000) {
+      Serial.println("{\"msg\":\"HEARTBEAT\"}");
+      lastHeartbeat = millis();
+    }
 
     // CRITICAL SECTION: Reading/Purging the Vector
     if (xSemaphoreTake(dbMutex, portMAX_DELAY)) {
@@ -140,11 +145,15 @@ void outputTask(void * parameter) {
         // Print Logic
         if (!first) Serial.print(",");
         Serial.print("{\"mac\":\"");
-        Serial.print(it->mac);
+        Serial.print(macToString(it->mac));
         Serial.print("\",\"rssi\":");
         Serial.print(it->rssi);
         Serial.print(",\"type\":\"");
-        Serial.print(it->type);
+        
+        if (it->typeCode == 1) Serial.print("ROUTER");
+        else if (it->typeCode == 2) Serial.print("STATION");
+        else Serial.print("Unknown");
+        
         Serial.print("\",\"seen_ms\":");
         Serial.print(timeSince);
         Serial.print("}");
@@ -172,7 +181,29 @@ void hopTask(void * parameter) {
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     currentChannel++;
     if (currentChannel > 13) currentChannel = 1;
-  }M
+  }
+}
+
+// --- Task: Serial Input ---
+void serialInputTask(void * parameter) {
+  while(1) {
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim(); // Remove whitespace/newlines
+
+      if (cmd.equalsIgnoreCase("CLEAR")) {
+        if (xSemaphoreTake(dbMutex, portMAX_DELAY)) {
+          foundDevices.clear();
+          Serial.println("{\"msg\":\"Database Cleared\"}");
+          xSemaphoreGive(dbMutex);
+        }
+      } else if (cmd.equalsIgnoreCase("RESTART")) {
+        ESP.restart();
+      }
+    }
+    // Check for input every 50ms to yield CPU
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
 }
 
 void setup() {
@@ -194,6 +225,7 @@ void setup() {
   xTaskCreatePinnedToCore(processingTask, "Process", 4096, NULL, 1, NULL, 0); // Core 0
   xTaskCreatePinnedToCore(outputTask,     "Output",  4096, NULL, 1, NULL, 1); // Core 1
   xTaskCreate(hopTask, "Hopper", 2048, NULL, 1, NULL);
+  xTaskCreate(serialInputTask, "SerialIn", 2048, NULL, 1, NULL);
 }
 
 void loop() {
