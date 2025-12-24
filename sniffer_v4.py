@@ -360,10 +360,11 @@ class DashboardWindow(QMainWindow):
         self.shortcut_log.activated.connect(self.btn_log.click)
         
         # Heartbeat Timer
-        self.hb_fade_timer = QTimer()
-        self.hb_fade_timer.setInterval(50) 
-        self.hb_fade_timer.timeout.connect(self.update_heartbeat_fade)
-        self.hb_intensity = 0.0
+        self.last_heartbeat_time = datetime.min
+        self.hb_blink_timer = QTimer()
+        self.hb_blink_timer.timeout.connect(self.blink_heartbeat)
+        self.hb_blink_timer.start(500)
+        self.hb_blink_state = False
 
     def refresh_ports(self):
         self.port_selector.clear()
@@ -411,23 +412,15 @@ class DashboardWindow(QMainWindow):
         color = NEON_RED if self.rec_blink_state else "#440000"
         self.lbl_rec.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 14px; margin-right: 10px;")
 
-    def trigger_heartbeat(self):
-        self.hb_intensity = 1.0
-        self.update_heartbeat_style()
-        self.hb_fade_timer.start()
-
-    def update_heartbeat_fade(self):
-        self.hb_intensity -= 0.05 # Fade out speed
-        if self.hb_intensity <= 0:
-            self.hb_intensity = 0
-            self.hb_fade_timer.stop()
-        self.update_heartbeat_style()
-
-    def update_heartbeat_style(self):
-        # Interpolate between Dark Green (#003300) and Neon Green (#00FF00)
-        # Green channel: 51 to 255
-        g = int(51 + (255 - 51) * self.hb_intensity)
-        self.lbl_heartbeat.setStyleSheet(f"color: #00{g:02X}00; font-weight: bold; font-size: 12px; margin-left: 10px;")
+    def blink_heartbeat(self):
+        # Check if we have received a heartbeat recently (within 7 seconds)
+        if (datetime.now() - self.last_heartbeat_time).total_seconds() < 7:
+            self.hb_blink_state = not self.hb_blink_state
+            color = NEON_GREEN if self.hb_blink_state else "#003300"
+        else:
+            color = "#003300"
+        
+        self.lbl_heartbeat.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px; margin-left: 10px;")
 
     def toggle_logging(self):
         if self.btn_log.isChecked():
@@ -543,7 +536,7 @@ class DashboardWindow(QMainWindow):
                 self.worker.send(msg)
                 self.log_to_terminal(f">> SENT: {msg}")
             else:
-                self.log_to_terminal("Usage: send <command_string>")
+                self.log_to_terminal("Usage: send <cmd>. Options: CLEAR, RESTART, DEVICE_TESTER, HOP_SPEED <ms>, LED_COLOR <r> <g> <b>, RAINBOW")
         else:
             self.log_to_terminal(f"Unknown command: {cmd}")
 
@@ -578,9 +571,10 @@ class DashboardWindow(QMainWindow):
         timestamp = datetime.now()
         
         if "msg" in data:
-            self.log_to_terminal(f"REMOTE: {data['msg']}")
             if data["msg"] == "HEARTBEAT":
-                self.trigger_heartbeat()
+                self.last_heartbeat_time = timestamp
+            else:
+                self.log_to_terminal(f"REMOTE: {data['msg']}")
 
         devices_list = data.get("devices", [])
         
@@ -625,7 +619,14 @@ class DashboardWindow(QMainWindow):
                 status_text = "UNKNOWN"
 
             self.device_table.setItem(row, 0, QTableWidgetItem(mac))
-            self.device_table.setItem(row, 1, QTableWidgetItem(dev_type))
+            
+            # Highlight Deauth Attacks
+            type_item = QTableWidgetItem(dev_type)
+            if dev_type == "DEAUTH":
+                type_item.setForeground(QColor(NEON_RED))
+                type_item.setFont(QFont("Monospace", weight=QFont.Weight.Bold))
+            self.device_table.setItem(row, 1, type_item)
+            
             self.device_table.setItem(row, 2, QTableWidgetItem(str(rssi)))
             self.device_table.setItem(row, 3, QTableWidgetItem(status_text))
             

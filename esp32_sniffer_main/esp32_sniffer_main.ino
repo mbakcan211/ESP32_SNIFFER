@@ -5,9 +5,9 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <cmath>
 
 // --- Configuration ---
-#define HOP_INTERVAL 50        
 #define PRINT_INTERVAL 100     
 #define PURGE_INTERVAL 10000   
 #define QUEUE_SIZE 64          // Hold up to 64 packets in buffer
@@ -17,7 +17,7 @@
 struct RawPacket {
   uint8_t mac[6];
   int rssi;
-  uint8_t typeCode; // 0=Unknown, 1=Router, 2=Station
+  uint8_t typeCode; // 0=Unknown, 1=Router, 2=Station, 3=Deauth
 };
 
 struct Device {
@@ -31,6 +31,8 @@ struct Device {
 std::vector<Device> foundDevices;
 QueueHandle_t packetQueue;
 SemaphoreHandle_t dbMutex; // Protects foundDevices vector
+int hopInterval = 50;
+TaskHandle_t rainbowTaskHandle = NULL;
 
 // --- Helpers ---
 String macToString(const uint8_t* mac) {
@@ -66,6 +68,9 @@ void wifi_promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   } else if (frameControl == 0x40) {
     typeCode = 2; // STATION
     macAddrPos = &data[10];
+  } else if (frameControl == 0xC0) {
+    typeCode = 3; // DEAUTH
+    macAddrPos = &data[10];
   } else if ((frameControl & 0x0C) == 0x08) { 
     typeCode = 2; // STATION
   }
@@ -97,7 +102,9 @@ void processingTask(void * parameter) {
             d.rssi = pkt.rssi;
             d.lastSeen = millis();
             // Update type if we learn more
-            if (d.typeCode == 0 || pkt.typeCode == 1) {
+            if (pkt.typeCode == 3) {
+              d.typeCode = 3; // Flag as Attacker/Deauth source
+            } else if (d.typeCode != 3 && (d.typeCode == 0 || pkt.typeCode == 1)) {
               d.typeCode = pkt.typeCode;
             }
             known = true;
@@ -152,6 +159,7 @@ void outputTask(void * parameter) {
         
         if (it->typeCode == 1) Serial.print("ROUTER");
         else if (it->typeCode == 2) Serial.print("STATION");
+        else if (it->typeCode == 3) Serial.print("DEAUTH");
         else Serial.print("Unknown");
         
         Serial.print("\",\"seen_ms\":");
@@ -177,10 +185,36 @@ void outputTask(void * parameter) {
 void hopTask(void * parameter) {
   int currentChannel = 1;
   while(1) {
-    vTaskDelay(HOP_INTERVAL / portTICK_PERIOD_MS); 
+    vTaskDelay(hopInterval / portTICK_PERIOD_MS); 
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     currentChannel++;
     if (currentChannel > 13) currentChannel = 1;
+  }
+}
+
+// --- Task: Rainbow LED Effect ---
+void ledRainbowTask(void * parameter) {
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  
+  float hue = 0.0;
+  while(1) {
+    // Sine wave based RGB cycling (Phase shifted by 120 degrees)
+    // sin() returns -1 to 1. We map it to 0-255.
+    int r = (int)(127.5 * (1.0 + sin(hue)));
+    int g = (int)(127.5 * (1.0 + sin(hue + 2.0944))); // +120 deg (2*PI/3)
+    int b = (int)(127.5 * (1.0 + sin(hue + 4.1888))); // +240 deg (4*PI/3)
+    
+    // Active Low Logic (Common Anode): 255 - val
+    analogWrite(LED_RED,   255 - r);
+    analogWrite(LED_GREEN, 255 - g);
+    analogWrite(LED_BLUE,  255 - b);
+    
+    hue += 0.05; // Speed of cycle
+    if (hue > 6.28318) hue -= 6.28318; // Wrap 2*PI
+    
+    vTaskDelay(20 / portTICK_PERIOD_MS); // 50Hz update rate
   }
 }
 
@@ -199,6 +233,78 @@ void serialInputTask(void * parameter) {
         }
       } else if (cmd.equalsIgnoreCase("RESTART")) {
         ESP.restart();
+      } else if (cmd.equalsIgnoreCase("DEVICE_TESTER")) {
+        // Stop Rainbow if running
+        if (rainbowTaskHandle != NULL) {
+          vTaskDelete(rainbowTaskHandle);
+          rainbowTaskHandle = NULL;
+        }
+
+        Serial.println("{\"msg\":\"Testing RGB LED...\"}");
+        
+        // Setup RGB pins (Active LOW on Nano ESP32)
+        pinMode(LED_RED, OUTPUT);
+        pinMode(LED_GREEN, OUTPUT);
+        pinMode(LED_BLUE, OUTPUT);
+        
+        // Cycle Colors (2 Seconds Total)
+        digitalWrite(LED_RED, LOW); digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, HIGH); // Red
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, LOW); digitalWrite(LED_BLUE, HIGH); // Green
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, LOW); // Blue
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, HIGH); // Off
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        
+        Serial.println("{\"msg\":\"Test Complete\"}");
+      } else if (cmd.startsWith("HOP_SPEED")) {
+        int val = cmd.substring(9).toInt();
+        if (val >= 10 && val <= 5000) {
+          hopInterval = val;
+          Serial.print("{\"msg\":\"Hop Speed set to ");
+          Serial.print(val);
+          Serial.println("ms\"}");
+        } else {
+          Serial.println("{\"msg\":\"Error: Speed must be 10-5000ms\"}");
+        }
+      } else if (cmd.startsWith("LED_COLOR")) {
+        int r, g, b;
+        
+        // Stop Rainbow if running
+        if (rainbowTaskHandle != NULL) {
+          vTaskDelete(rainbowTaskHandle);
+          rainbowTaskHandle = NULL;
+        }
+
+        // Parse 3 integers: LED_COLOR 255 128 0
+        if (sscanf(cmd.c_str(), "LED_COLOR %d %d %d", &r, &g, &b) == 3) {
+          // Constrain to 0-255
+          r = constrain(r, 0, 255);
+          g = constrain(g, 0, 255);
+          b = constrain(b, 0, 255);
+          
+          // Active Low Logic: 255-val because 0 is ON (Low Voltage)
+          analogWrite(LED_RED,   255 - r);
+          analogWrite(LED_GREEN, 255 - g);
+          analogWrite(LED_BLUE,  255 - b);
+          Serial.println("{\"msg\":\"LED Color Updated (PWM)\"}");
+        } else {
+          Serial.println("{\"msg\":\"Usage: LED_COLOR <R> <G> <B> (0-255)\"}");
+        }
+      } else if (cmd.equalsIgnoreCase("RAINBOW")) {
+        if (rainbowTaskHandle == NULL) {
+           xTaskCreate(ledRainbowTask, "Rainbow", 2048, NULL, 1, &rainbowTaskHandle);
+           Serial.println("{\"msg\":\"Rainbow Mode ON\"}");
+        } else {
+           vTaskDelete(rainbowTaskHandle);
+           rainbowTaskHandle = NULL;
+           // Turn off LEDs
+           analogWrite(LED_RED, 255);
+           analogWrite(LED_GREEN, 255);
+           analogWrite(LED_BLUE, 255);
+           Serial.println("{\"msg\":\"Rainbow Mode OFF\"}");
+        }
       }
     }
     // Check for input every 50ms to yield CPU
