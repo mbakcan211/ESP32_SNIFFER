@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Arduino / PlatformIO
+.pio/
+.vscode/
+build/
+*.bin
+*.elf
+
+# OS specific
+.DS_Store
+Thumbs.db
