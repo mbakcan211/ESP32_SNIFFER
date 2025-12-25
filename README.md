@@ -49,6 +49,7 @@ A low-cost, real-time WiFi traffic analysis and physical distance estimation too
 ## 📄 Documentation
 
 The full technical report (in Turkish) is available in the `docs/` folder: Project_Report_TR.pdf.
+NOTE: Report is currently not available.
 
 ## ⚠️ Disclaimer
 
@@ -56,4 +57,4 @@ This project is for **educational and research purposes only**. Monitoring wirel
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the GNU General Public License v3.0 - see the LICENSE file for details.
